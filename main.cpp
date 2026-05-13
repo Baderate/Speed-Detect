@@ -282,6 +282,11 @@ int main()
         }
 
         EKFOptions options;
+        options.roadPositionNoiseM = 0.5;
+        if (source == 2 && useSDMatched != 0) {
+            options.roadPositionNoiseM = 3.0;
+        }
+
         std::vector<CarPoint> result = RunEKFFusion(coords, matchedPoints, options);
         const std::string ekfOutputFile = BuildEKFOutputFile(
             source,

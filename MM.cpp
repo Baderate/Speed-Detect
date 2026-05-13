@@ -106,6 +106,22 @@ static const double NODE_MERGE_THRESH = 3.0;
 // 分链阈值，单位：秒
 static const double CHAIN_RESET_GAP_SEC = 5.0;
 
+// Paper-style state machine parameters:
+// SMP/RMP/IMP/EDP follow Yu et al.'s EKF + MM vehicle self-localization method.
+static const int PAPER_SMP_WINDOW = 5;
+static const double PAPER_SMP_RADIUS = 42.0;
+static const double PAPER_WSMP_D = 0.7;
+static const double PAPER_WSMP_H = 0.3;
+static const double PAPER_WIMP_D = 0.2;
+static const double PAPER_WIMP_H = 0.2;
+static const double PAPER_WIMP_C = 0.6;
+static const double PAPER_EDP_HEADING_TH = 60.0 * PI / 180.0;
+static const double PAPER_EDP_DIST_TH = PAPER_SMP_RADIUS;
+static const double PAPER_STATIC_SPEED = 0.35;
+static const double PAPER_INTERSECTION_BUFFER = 5.0;
+static const double PAPER_WMM = 0.80;
+static const double PAPER_WPJ = 0.20;
+
 // =====================================================
 // 功能开关
 // =====================================================
@@ -581,6 +597,7 @@ struct ProvisionalState
     double y = 0.0;
     double s = 0.0;
     double lane_offset = 0.0;
+    double road_heading = 0.0;
 };
 
 struct EpochMeta
@@ -1252,8 +1269,1051 @@ static MMState updateState(
     return MM_INIT;
 }
 
+struct PaperProjection
+{
+    bool valid = false;
+    double x = 0.0;
+    double y = 0.0;
+    double xc = 0.0;
+    double yc = 0.0;
+    double t = 0.0;
+    double seg_len = 0.0;
+    double s = 0.0;
+    double lane_offset = 0.0;
+    double dist = 0.0;
+};
+
+static double paperDistanceIndex(double d)
+{
+    double v = 1.064 * std::exp(-sqr((d + 8.703) / 35.37));
+    return clampDouble(v, 0.0, 1.0);
+}
+
+static double paperHeadingIndex(double dhRad)
+{
+    double dhDeg = dhRad * 180.0 / PI;
+    double v = 7.973 * std::exp(-sqr((dhDeg + 204.4) / 141.8));
+    return clampDouble(v, 0.0, 1.0);
+}
+
+static bool getVelocityHeading(
+    const CoorData& c,
+    double& speed,
+    double& heading)
+{
+    double vE = 0.0;
+    double vN = 0.0;
+    bool valid = false;
+
+    if (std::isfinite(c.phaE) && std::isfinite(c.phaN))
+    {
+        double s = std::sqrt(c.phaE * c.phaE + c.phaN * c.phaN);
+        if (std::isfinite(s) && s >= 0.05 && s <= 60.0)
+        {
+            vE = c.phaE;
+            vN = c.phaN;
+            valid = true;
+        }
+    }
+
+    if (!valid && std::isfinite(c.velE) && std::isfinite(c.velN))
+    {
+        double s = std::sqrt(c.velE * c.velE + c.velN * c.velN);
+        if (std::isfinite(s) && s <= 60.0)
+        {
+            vE = c.velE;
+            vN = c.velN;
+            valid = true;
+        }
+    }
+
+    if (!valid)
+        return false;
+
+    speed = std::sqrt(vE * vE + vN * vN);
+    if (speed <= PAPER_STATIC_SPEED)
+        return false;
+
+    heading = std::atan2(vN, vE);
+    return true;
+}
+
+static bool getRawSpeed(
+    const CoorData& c,
+    double& speed,
+    double& heading,
+    bool& hasMovingHeading)
+{
+    double vE = 0.0;
+    double vN = 0.0;
+    bool valid = false;
+
+    if (std::isfinite(c.phaE) && std::isfinite(c.phaN))
+    {
+        double s = std::sqrt(c.phaE * c.phaE + c.phaN * c.phaN);
+        if (std::isfinite(s) && s >= 0.05 && s <= 60.0)
+        {
+            vE = c.phaE;
+            vN = c.phaN;
+            valid = true;
+        }
+    }
+
+    if (!valid && std::isfinite(c.velE) && std::isfinite(c.velN))
+    {
+        double s = std::sqrt(c.velE * c.velE + c.velN * c.velN);
+        if (std::isfinite(s) && s <= 60.0)
+        {
+            vE = c.velE;
+            vN = c.velN;
+            valid = true;
+        }
+    }
+
+    if (!valid)
+    {
+        speed = 0.0;
+        heading = 0.0;
+        hasMovingHeading = false;
+        return false;
+    }
+
+    speed = std::sqrt(vE * vE + vN * vN);
+    hasMovingHeading = speed > PAPER_STATIC_SPEED;
+    heading = hasMovingHeading ? std::atan2(vN, vE) : 0.0;
+    return true;
+}
+
+static bool getObservationHeading(
+    const std::vector<CoorData>& coords,
+    size_t idx,
+    const LocalRef& ref,
+    double& heading)
+{
+    if (coords.size() < 2)
+        return false;
+
+    size_t a = idx;
+    size_t b = idx;
+
+    if (idx > 0) {
+        a = idx - 1;
+        b = idx;
+    }
+    else if (idx + 1 < coords.size()) {
+        a = idx;
+        b = idx + 1;
+    }
+    else {
+        return false;
+    }
+
+    double x1 = 0.0;
+    double y1 = 0.0;
+    double x2 = 0.0;
+    double y2 = 0.0;
+    ll2xy(coords[a].BLH[0], coords[a].BLH[1], ref, x1, y1);
+    ll2xy(coords[b].BLH[0], coords[b].BLH[1], ref, x2, y2);
+
+    double dx = x2 - x1;
+    double dy = y2 - y1;
+    if (dx * dx + dy * dy <= 1.0)
+        return false;
+
+    heading = std::atan2(dy, dx);
+    return true;
+}
+
+static double chooseSegmentHeading(
+    const RoadSegmentXY& seg,
+    bool hasPreferred,
+    double preferredHeading)
+{
+    if (!hasPreferred)
+        return seg.heading;
+
+    double h1 = seg.heading;
+    double h2 = seg.heading + PI;
+    return angleDiff(preferredHeading, h1) <= angleDiff(preferredHeading, h2)
+        ? h1
+        : h2;
+}
+
+static double headingAwayFromPoint(
+    const RoadSegmentXY& seg,
+    double x,
+    double y)
+{
+    double d1 = sqr(x - seg.x1) + sqr(y - seg.y1);
+    double d2 = sqr(x - seg.x2) + sqr(y - seg.y2);
+    return d1 <= d2 ? seg.heading : seg.heading + PI;
+}
+
+static bool segmentTouchesNode(
+    const RoadSegmentXY& seg,
+    double nodeX,
+    double nodeY,
+    double threshold)
+{
+    return
+        sqr(seg.x1 - nodeX) + sqr(seg.y1 - nodeY) <= threshold * threshold ||
+        sqr(seg.x2 - nodeX) + sqr(seg.y2 - nodeY) <= threshold * threshold;
+}
+
+static bool projectToLane(
+    const RoadSegmentXY& seg,
+    double x,
+    double y,
+    double laneOffset,
+    PaperProjection& out)
+{
+    double xc = 0.0;
+    double yc = 0.0;
+    double t = 0.0;
+    double segLen = 0.0;
+
+    if (!projectPointToSegment(x, y, seg, xc, yc, t, segLen))
+        return false;
+
+    double vx = seg.x2 - seg.x1;
+    double vy = seg.y2 - seg.y1;
+    double len = std::sqrt(vx * vx + vy * vy);
+    if (len < 1e-8)
+        return false;
+
+    double nx = -vy / len;
+    double ny = vx / len;
+
+    out.valid = true;
+    out.xc = xc;
+    out.yc = yc;
+    out.t = t;
+    out.seg_len = segLen;
+    out.s = t * segLen;
+    out.lane_offset = laneOffset;
+    out.x = xc + laneOffset * nx;
+    out.y = yc + laneOffset * ny;
+    out.dist = std::sqrt(sqr(out.x - x) + sqr(out.y - y));
+    return true;
+}
+
+static bool findBestLaneProjection(
+    const RoadSegmentXY& seg,
+    double x,
+    double y,
+    PaperProjection& best)
+{
+    bool found = false;
+    int laneCount = GetVirtualLaneOffsetCount(g_MMUseVirtualLaneOffset);
+    for (int k = 0; k < laneCount; ++k)
+    {
+        PaperProjection cur;
+        double laneOffset = GetVirtualLaneOffset(g_MMUseVirtualLaneOffset, k);
+        if (!projectToLane(seg, x, y, laneOffset, cur))
+            continue;
+
+        if (!found || cur.dist < best.dist)
+        {
+            best = cur;
+            found = true;
+        }
+    }
+    return found;
+}
+
+static bool projectToPreferredLane(
+    const RoadSegmentXY& seg,
+    double x,
+    double y,
+    double preferredLaneOffset,
+    PaperProjection& out)
+{
+    if (!g_MMUseVirtualLaneOffset)
+        return projectToLane(seg, x, y, 0.0, out);
+
+    return projectToLane(seg, x, y, preferredLaneOffset, out);
+}
+
+static SeqCandidate makeCandidateFromProjection(
+    const RoadSegmentXY& seg,
+    const PaperProjection& proj,
+    double xObs,
+    double yObs,
+    double xDr,
+    double yDr,
+    double roadHeading,
+    bool hasVehicleHeading,
+    double vehicleHeading,
+    double score)
+{
+    SeqCandidate cand;
+    cand.seg_id = seg.id;
+    cand.cluster_id = seg.clusterId;
+    cand.x = proj.x;
+    cand.y = proj.y;
+    cand.xc = proj.xc;
+    cand.yc = proj.yc;
+    cand.tproj = proj.t;
+    cand.seg_len = proj.seg_len;
+    cand.s = proj.s;
+    cand.lane_offset = proj.lane_offset;
+    cand.d_obs = std::sqrt(sqr(cand.x - xObs) + sqr(cand.y - yObs));
+    cand.d_dr = std::sqrt(sqr(cand.x - xDr) + sqr(cand.y - yDr));
+    cand.dir_diff = hasVehicleHeading
+        ? roadHeadingDiffBidirectional(vehicleHeading, roadHeading)
+        : 0.0;
+    cand.emit_cost = -score;
+    return cand;
+}
+
+static bool runPaperSMP(
+    const std::vector<CoorData>& coords,
+    size_t startIdx,
+    const std::vector<RoadSegmentXY>& segments,
+    const LocalRef& ref,
+    int& outSegId)
+{
+    outSegId = -1;
+    if (startIdx >= coords.size() || segments.empty())
+        return false;
+
+    size_t endIdx = std::min(
+        coords.size(),
+        startIdx + static_cast<size_t>(PAPER_SMP_WINDOW));
+
+    std::set<int> candidateIds;
+    for (size_t i = startIdx; i < endIdx; ++i)
+    {
+        double x = 0.0;
+        double y = 0.0;
+        ll2xy(coords[i].BLH[0], coords[i].BLH[1], ref, x, y);
+
+        std::vector<int> nearIds;
+        collectAllNearSegments(segments, x, y, PAPER_SMP_RADIUS, nearIds);
+        for (size_t k = 0; k < nearIds.size(); ++k)
+            candidateIds.insert(nearIds[k]);
+    }
+
+    if (candidateIds.empty())
+    {
+        double x = 0.0;
+        double y = 0.0;
+        ll2xy(coords[startIdx].BLH[0], coords[startIdx].BLH[1], ref, x, y);
+
+        double bestDist = std::numeric_limits<double>::infinity();
+        int bestId = -1;
+        for (size_t sid = 0; sid < segments.size(); ++sid)
+        {
+            PaperProjection proj;
+            if (!findBestLaneProjection(segments[sid], x, y, proj))
+                continue;
+            if (proj.dist < bestDist)
+            {
+                bestDist = proj.dist;
+                bestId = static_cast<int>(sid);
+            }
+        }
+        if (bestId >= 0)
+            candidateIds.insert(bestId);
+    }
+
+    double bestScore = -1.0;
+    int bestSeg = -1;
+    int sampleCount = std::max(1, static_cast<int>(endIdx - startIdx));
+
+    for (std::set<int>::const_iterator it = candidateIds.begin();
+        it != candidateIds.end();
+        ++it)
+    {
+        int sid = *it;
+        if (sid < 0 || sid >= (int)segments.size())
+            continue;
+
+        double total = 0.0;
+        for (size_t i = startIdx; i < endIdx; ++i)
+        {
+            double x = 0.0;
+            double y = 0.0;
+            ll2xy(coords[i].BLH[0], coords[i].BLH[1], ref, x, y);
+
+            PaperProjection proj;
+            if (!findBestLaneProjection(segments[sid], x, y, proj))
+                continue;
+
+            double speed = 0.0;
+            double heading = 0.0;
+            bool hasHeading = getVelocityHeading(coords[i], speed, heading);
+            if (!hasHeading)
+                hasHeading = getObservationHeading(coords, i, ref, heading);
+
+            double roadHeading = chooseSegmentHeading(
+                segments[sid],
+                hasHeading,
+                heading);
+            double dh = hasHeading
+                ? roadHeadingDiffBidirectional(heading, roadHeading)
+                : 0.0;
+
+            double score =
+                PAPER_WSMP_D * paperDistanceIndex(proj.dist) +
+                PAPER_WSMP_H * paperHeadingIndex(dh);
+            total += score;
+        }
+
+        double avg = total / sampleCount;
+        if (avg > bestScore)
+        {
+            bestScore = avg;
+            bestSeg = sid;
+        }
+    }
+
+    outSegId = bestSeg;
+    return outSegId >= 0;
+}
+
+static bool makePaperInitialCandidate(
+    const RoadSegmentXY& seg,
+    double xObs,
+    double yObs,
+    double xDr,
+    double yDr,
+    bool hasVehicleHeading,
+    double vehicleHeading,
+    SeqCandidate& out)
+{
+    PaperProjection proj;
+    if (!findBestLaneProjection(seg, xDr, yDr, proj))
+        return false;
+
+    double roadHeading = chooseSegmentHeading(seg, hasVehicleHeading, vehicleHeading);
+    double dh = hasVehicleHeading
+        ? roadHeadingDiffBidirectional(vehicleHeading, roadHeading)
+        : 0.0;
+    double score =
+        PAPER_WSMP_D * paperDistanceIndex(proj.dist) +
+        PAPER_WSMP_H * paperHeadingIndex(dh);
+
+    out = makeCandidateFromProjection(
+        seg,
+        proj,
+        xObs,
+        yObs,
+        xDr,
+        yDr,
+        roadHeading,
+        hasVehicleHeading,
+        vehicleHeading,
+        score);
+    return true;
+}
+
+static bool findAheadTopologyNode(
+    const RoadSegmentXY& seg,
+    int segId,
+    const std::vector<std::vector<int> >& adjacency,
+    double x,
+    double y,
+    double roadHeading,
+    double& nodeX,
+    double& nodeY,
+    double& distAhead)
+{
+    if (segId < 0 || segId >= (int)adjacency.size())
+        return false;
+
+    if (adjacency[segId].empty())
+        return false;
+
+    double ux = std::cos(roadHeading);
+    double uy = std::sin(roadHeading);
+    bool found = false;
+    double bestDist = std::numeric_limits<double>::infinity();
+
+    double endpoints[2][2] = {
+        { seg.x1, seg.y1 },
+        { seg.x2, seg.y2 }
+    };
+
+    for (int i = 0; i < 2; ++i)
+    {
+        double dx = endpoints[i][0] - x;
+        double dy = endpoints[i][1] - y;
+        double along = dx * ux + dy * uy;
+        double dist = std::sqrt(dx * dx + dy * dy);
+
+        if (along < -2.0)
+            continue;
+
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            nodeX = endpoints[i][0];
+            nodeY = endpoints[i][1];
+            found = true;
+        }
+    }
+
+    distAhead = bestDist;
+    return found;
+}
+
+static bool makePaperRMPCandidate(
+    const RoadSegmentXY& seg,
+    const ProvisionalState& prevState,
+    double xObs,
+    double yObs,
+    double xDr,
+    double yDr,
+    double predStep,
+    bool hasVehicleHeading,
+    double vehicleHeading,
+    SeqCandidate& out)
+{
+    double roadHeading = chooseSegmentHeading(seg, hasVehicleHeading, vehicleHeading);
+    if (prevState.valid && angleDiff(prevState.road_heading, roadHeading) < PI * 0.75)
+        roadHeading = prevState.road_heading;
+
+    PaperProjection pj;
+    if (prevState.valid && prevState.seg_id == seg.id)
+    {
+        if (!projectToPreferredLane(seg, xDr, yDr, prevState.lane_offset, pj))
+            return false;
+    }
+    else if (!findBestLaneProjection(seg, xDr, yDr, pj))
+    {
+        return false;
+    }
+
+    double predX = pj.x;
+    double predY = pj.y;
+    if (prevState.valid)
+    {
+        predX = prevState.x + predStep * std::cos(roadHeading);
+        predY = prevState.y + predStep * std::sin(roadHeading);
+    }
+
+    double fusedX = PAPER_WMM * predX + PAPER_WPJ * pj.x;
+    double fusedY = PAPER_WMM * predY + PAPER_WPJ * pj.y;
+
+    PaperProjection fusedProj;
+    if (!projectToPreferredLane(seg, fusedX, fusedY, pj.lane_offset, fusedProj))
+        return false;
+
+    double dh = hasVehicleHeading
+        ? roadHeadingDiffBidirectional(vehicleHeading, roadHeading)
+        : 0.0;
+    double score =
+        PAPER_WSMP_D * paperDistanceIndex(fusedProj.dist) +
+        PAPER_WSMP_H * paperHeadingIndex(dh);
+
+    out = makeCandidateFromProjection(
+        seg,
+        fusedProj,
+        xObs,
+        yObs,
+        xDr,
+        yDr,
+        roadHeading,
+        hasVehicleHeading,
+        vehicleHeading,
+        score);
+    return true;
+}
+
+static bool makePaperIMPCandidate(
+    int currentSegId,
+    const std::vector<RoadSegmentXY>& segments,
+    const std::vector<std::vector<int> >& adjacency,
+    double nodeX,
+    double nodeY,
+    double overshoot,
+    double xObs,
+    double yObs,
+    double xDr,
+    double yDr,
+    bool hasVehicleHeading,
+    double vehicleHeading,
+    SeqCandidate& out)
+{
+    if (currentSegId < 0 || currentSegId >= (int)adjacency.size())
+        return false;
+
+    std::set<int> candidateIds;
+    for (size_t i = 0; i < adjacency[currentSegId].size(); ++i)
+    {
+        int sid = adjacency[currentSegId][i];
+        if (sid < 0 || sid >= (int)segments.size())
+            continue;
+
+        if (segmentTouchesNode(segments[sid], nodeX, nodeY, 12.0))
+            candidateIds.insert(sid);
+    }
+
+    if (candidateIds.empty())
+        candidateIds.insert(currentSegId);
+
+    bool found = false;
+    double bestScore = -1.0;
+    SeqCandidate bestCand;
+
+    for (std::set<int>::const_iterator it = candidateIds.begin();
+        it != candidateIds.end();
+        ++it)
+    {
+        int sid = *it;
+        if (sid < 0 || sid >= (int)segments.size())
+            continue;
+
+        const RoadSegmentXY& seg = segments[sid];
+        double roadHeading = headingAwayFromPoint(seg, nodeX, nodeY);
+
+        PaperProjection pj;
+        if (!findBestLaneProjection(seg, xDr, yDr, pj))
+            continue;
+
+        double predX = nodeX + overshoot * std::cos(roadHeading);
+        double predY = nodeY + overshoot * std::sin(roadHeading);
+
+        double fusedX = PAPER_WMM * predX + PAPER_WPJ * pj.x;
+        double fusedY = PAPER_WMM * predY + PAPER_WPJ * pj.y;
+
+        PaperProjection fusedProj;
+        if (!projectToPreferredLane(seg, fusedX, fusedY, pj.lane_offset, fusedProj))
+            continue;
+
+        double dh = hasVehicleHeading
+            ? roadHeadingDiffBidirectional(vehicleHeading, roadHeading)
+            : 0.0;
+        double score =
+            PAPER_WIMP_D * paperDistanceIndex(pj.dist) +
+            PAPER_WIMP_H * paperHeadingIndex(dh) +
+            PAPER_WIMP_C;
+
+        SeqCandidate cand = makeCandidateFromProjection(
+            seg,
+            fusedProj,
+            xObs,
+            yObs,
+            xDr,
+            yDr,
+            roadHeading,
+            hasVehicleHeading,
+            vehicleHeading,
+            score);
+
+        if (!found || score > bestScore)
+        {
+            found = true;
+            bestScore = score;
+            bestCand = cand;
+        }
+    }
+
+    if (!found)
+        return false;
+
+    out = bestCand;
+    return true;
+}
+
+static void updatePaperProvisionalState(
+    const SeqCandidate& cand,
+    double roadHeading,
+    ProvisionalState& state)
+{
+    state.valid = true;
+    state.seg_id = cand.seg_id;
+    state.cluster_id = cand.cluster_id;
+    state.x = cand.x;
+    state.y = cand.y;
+    state.s = cand.s;
+    state.lane_offset = cand.lane_offset;
+    state.road_heading = roadHeading;
+}
+
 
 // ---------------------------- 输出 ----------------------------
+
+static std::vector<SeqCandidate> runPaperStateMachineMM(
+    std::vector<CoorData>& coords,
+    const std::vector<RoadSegmentXY>& segments,
+    const std::vector<std::vector<int> >& adjacency,
+    const LocalRef& ref)
+{
+    std::vector<SeqCandidate> chosen(coords.size());
+
+    ProvisionalState prevState;
+    int currentSegId = -1;
+    double vx_last = 0.0;
+    double vy_last = 0.0;
+    bool has_vel = false;
+    bool has_prev = false;
+
+    double prevObsX = 0.0;
+    double prevObsY = 0.0;
+    bool hasPrevObs = false;
+
+    for (size_t idx = 0; idx < coords.size(); ++idx)
+    {
+        CoorData& c = coords[idx];
+
+        double x_obs = 0.0;
+        double y_obs = 0.0;
+        ll2xy(c.BLH[0], c.BLH[1], ref, x_obs, y_obs);
+
+        double dt = 1.0;
+        if (idx > 0)
+        {
+            long long t1 = ComputeCoorTimestampSec(coords[idx - 1]);
+            long long t2 = ComputeCoorTimestampSec(coords[idx]);
+            double dts = static_cast<double>(t2 - t1);
+
+            if (std::isfinite(dts) && dts > 0.05 && dts < 10.0)
+                dt = dts;
+
+            if (std::isfinite(dts) && dts > CHAIN_RESET_GAP_SEC)
+            {
+                prevState = ProvisionalState();
+                currentSegId = -1;
+                has_prev = false;
+                has_vel = false;
+            }
+        }
+
+        double obsStep = 0.0;
+        if (hasPrevObs)
+        {
+            obsStep = std::sqrt(
+                sqr(x_obs - prevObsX) +
+                sqr(y_obs - prevObsY));
+        }
+
+        SDMMRequest sd_epoch_req;
+        sd_epoch_req.stage = SD_MM_STAGE_EPOCH;
+        sd_epoch_req.use_sd = g_MMEnableSpeedSD;
+        sd_epoch_req.mode = g_MMSpeedSDMode;
+        sd_epoch_req.has_prev = has_prev;
+        sd_epoch_req.has_vel = has_vel;
+        sd_epoch_req.prev_x = prevState.x;
+        sd_epoch_req.prev_y = prevState.y;
+        sd_epoch_req.vx_last = vx_last;
+        sd_epoch_req.vy_last = vy_last;
+        sd_epoch_req.dt = dt;
+        sd_epoch_req.x_obs = x_obs;
+        sd_epoch_req.y_obs = y_obs;
+
+        SDMMResult sd_epoch;
+        SD_MMEvaluate(&c, sd_epoch_req, sd_epoch);
+
+        if (!sd_epoch.enabled || !has_prev)
+        {
+            sd_epoch.x_dr = x_obs;
+            sd_epoch.y_dr = y_obs;
+            sd_epoch.x_center = x_obs;
+            sd_epoch.y_center = y_obs;
+            sd_epoch.trusted = true;
+            sd_epoch.trust_reason = 0;
+            sd_epoch.quality_score = 1.0;
+        }
+
+        if (!std::isfinite(sd_epoch.x_dr) || !std::isfinite(sd_epoch.y_dr))
+        {
+            sd_epoch.x_dr = x_obs;
+            sd_epoch.y_dr = y_obs;
+        }
+        if (!std::isfinite(sd_epoch.x_center) || !std::isfinite(sd_epoch.y_center))
+        {
+            sd_epoch.x_center = x_obs;
+            sd_epoch.y_center = y_obs;
+        }
+
+        c.trusted = sd_epoch.trusted;
+        c.trust_reason = sd_epoch.trust_reason;
+        c.quality_score = sd_epoch.quality_score;
+
+        double matchX = sd_epoch.x_center;
+        double matchY = sd_epoch.y_center;
+
+        double rawSpeed = 0.0;
+        double rawHeading = 0.0;
+        bool hasRawSpeed = false;
+        bool hasRawMovingHeading = false;
+        hasRawSpeed = getRawSpeed(c, rawSpeed, rawHeading, hasRawMovingHeading);
+
+        double vehicleSpeed = 0.0;
+        double vehicleHeading = 0.0;
+        bool hasVehicleHeading = false;
+
+        if (sd_epoch.has_speed && sd_epoch.speed > PAPER_STATIC_SPEED)
+        {
+            vehicleSpeed = sd_epoch.speed;
+            vehicleHeading = std::atan2(sd_epoch.vN, sd_epoch.vE);
+            hasVehicleHeading = true;
+        }
+        else
+        {
+            vehicleSpeed = rawSpeed;
+            vehicleHeading = rawHeading;
+            hasVehicleHeading = hasRawMovingHeading;
+        }
+
+        if (!hasVehicleHeading)
+        {
+            double obsHeading = 0.0;
+            if (getObservationHeading(coords, idx, ref, obsHeading))
+            {
+                vehicleHeading = obsHeading;
+                hasVehicleHeading = true;
+            }
+        }
+
+        if (vehicleSpeed <= PAPER_STATIC_SPEED && dt > 1e-6)
+            vehicleSpeed = obsStep / dt;
+
+        SDMMRequest sd_trans_req;
+        sd_trans_req.stage = SD_MM_STAGE_TRANSITION;
+        sd_trans_req.use_sd = g_MMEnableSpeedSD;
+        sd_trans_req.mode = g_MMSpeedSDMode;
+        sd_trans_req.has_speed_meas = sd_epoch.has_speed;
+        sd_trans_req.speed_meas = sd_epoch.speed;
+        sd_trans_req.dt = dt;
+        sd_trans_req.fallback_step =
+            vehicleSpeed > PAPER_STATIC_SPEED ? vehicleSpeed * dt : obsStep;
+
+        SDMMResult sd_trans_out;
+        SD_MMEvaluate(nullptr, sd_trans_req, sd_trans_out);
+
+        double predStep = sd_trans_out.pred_step;
+        if (!std::isfinite(predStep) || predStep < 0.0)
+            predStep = sd_trans_req.fallback_step;
+
+        bool hasStaticSpeed = sd_epoch.has_speed || hasRawSpeed;
+        double staticSpeed = sd_epoch.has_speed ? sd_epoch.speed : rawSpeed;
+        bool isStaticEpoch =
+            sd_epoch.is_static_epoch ||
+            (has_prev && hasStaticSpeed &&
+                staticSpeed <= PAPER_STATIC_SPEED &&
+                obsStep <= STOP_HOLD_DIST);
+
+        SeqCandidate cand;
+        bool madeCandidate = false;
+        double roadHeading = 0.0;
+
+        if (isStaticEpoch &&
+            prevState.valid &&
+            currentSegId >= 0 &&
+            currentSegId < (int)segments.size())
+        {
+            PaperProjection holdProj;
+            if (projectToPreferredLane(
+                segments[currentSegId],
+                prevState.x,
+                prevState.y,
+                prevState.lane_offset,
+                holdProj))
+            {
+                roadHeading = prevState.road_heading;
+                cand = makeCandidateFromProjection(
+                    segments[currentSegId],
+                    holdProj,
+                    x_obs,
+                    y_obs,
+                    matchX,
+                    matchY,
+                    roadHeading,
+                    hasVehicleHeading,
+                    vehicleHeading,
+                    1.0);
+                madeCandidate = true;
+            }
+        }
+
+        if (!madeCandidate &&
+            (!prevState.valid ||
+                currentSegId < 0 ||
+                currentSegId >= (int)segments.size()))
+        {
+            int initSegId = -1;
+            if (runPaperSMP(coords, idx, segments, ref, initSegId) &&
+                initSegId >= 0 &&
+                initSegId < (int)segments.size())
+            {
+                roadHeading = chooseSegmentHeading(
+                    segments[initSegId],
+                    hasVehicleHeading,
+                    vehicleHeading);
+                madeCandidate = makePaperInitialCandidate(
+                    segments[initSegId],
+                    x_obs,
+                    y_obs,
+                    matchX,
+                    matchY,
+                    hasVehicleHeading,
+                    vehicleHeading,
+                    cand);
+            }
+        }
+
+        if (!madeCandidate &&
+            currentSegId >= 0 &&
+            currentSegId < (int)segments.size())
+        {
+            const RoadSegmentXY& currentSeg = segments[currentSegId];
+            double nodeX = 0.0;
+            double nodeY = 0.0;
+            double distAhead = 0.0;
+            bool hasAheadNode = findAheadTopologyNode(
+                currentSeg,
+                currentSegId,
+                adjacency,
+                prevState.x,
+                prevState.y,
+                prevState.road_heading,
+                nodeX,
+                nodeY,
+                distAhead);
+
+            if (hasAheadNode &&
+                predStep + PAPER_INTERSECTION_BUFFER >= distAhead)
+            {
+                double overshoot = std::max(0.0, predStep - distAhead);
+                madeCandidate = makePaperIMPCandidate(
+                    currentSegId,
+                    segments,
+                    adjacency,
+                    nodeX,
+                    nodeY,
+                    overshoot,
+                    x_obs,
+                    y_obs,
+                    matchX,
+                    matchY,
+                    hasVehicleHeading,
+                    vehicleHeading,
+                    cand);
+            }
+
+            if (!madeCandidate)
+            {
+                madeCandidate = makePaperRMPCandidate(
+                    currentSeg,
+                    prevState,
+                    x_obs,
+                    y_obs,
+                    matchX,
+                    matchY,
+                    predStep,
+                    hasVehicleHeading,
+                    vehicleHeading,
+                    cand);
+            }
+        }
+
+        if (!madeCandidate || cand.seg_id < 0)
+        {
+            SeqCandidate raw;
+            raw.seg_id = -1;
+            raw.x = x_obs;
+            raw.y = y_obs;
+            raw.d_obs = 0.0;
+            chosen[idx] = raw;
+
+            prevState = ProvisionalState();
+            currentSegId = -1;
+            has_prev = false;
+            has_vel = false;
+            hasPrevObs = true;
+            prevObsX = x_obs;
+            prevObsY = y_obs;
+            continue;
+        }
+
+        roadHeading = chooseSegmentHeading(
+            segments[cand.seg_id],
+            hasVehicleHeading,
+            vehicleHeading);
+
+        if (prevState.valid &&
+            cand.seg_id == prevState.seg_id &&
+            angleDiff(prevState.road_heading, roadHeading) < PI * 0.75)
+        {
+            roadHeading = prevState.road_heading;
+        }
+
+        if (hasVehicleHeading)
+            cand.dir_diff = roadHeadingDiffBidirectional(vehicleHeading, roadHeading);
+
+        bool exceptionDetected =
+            !isStaticEpoch &&
+            ((hasVehicleHeading && cand.dir_diff > PAPER_EDP_HEADING_TH) ||
+                cand.d_dr > PAPER_EDP_DIST_TH);
+
+        if (exceptionDetected)
+        {
+            int resetSegId = -1;
+            SeqCandidate resetCand;
+            if (runPaperSMP(coords, idx, segments, ref, resetSegId) &&
+                resetSegId >= 0 &&
+                resetSegId < (int)segments.size() &&
+                makePaperInitialCandidate(
+                    segments[resetSegId],
+                    x_obs,
+                    y_obs,
+                    matchX,
+                    matchY,
+                    hasVehicleHeading,
+                    vehicleHeading,
+                    resetCand))
+            {
+                cand = resetCand;
+                roadHeading = chooseSegmentHeading(
+                    segments[cand.seg_id],
+                    hasVehicleHeading,
+                    vehicleHeading);
+                currentSegId = cand.seg_id;
+            }
+        }
+
+        chosen[idx] = cand;
+
+        double old_prev_x = prevState.x;
+        double old_prev_y = prevState.y;
+
+        SDMMRequest sd_update_req;
+        sd_update_req.stage = SD_MM_STAGE_UPDATE;
+        sd_update_req.use_sd = g_MMEnableSpeedSD;
+        sd_update_req.mode = g_MMSpeedSDMode;
+        sd_update_req.has_speed_meas = sd_epoch.has_speed;
+        sd_update_req.has_prev = has_prev;
+        sd_update_req.vE_meas = sd_epoch.vE;
+        sd_update_req.vN_meas = sd_epoch.vN;
+        sd_update_req.best_x = cand.x;
+        sd_update_req.best_y = cand.y;
+        sd_update_req.old_prev_x = old_prev_x;
+        sd_update_req.old_prev_y = old_prev_y;
+        sd_update_req.dt = dt;
+        sd_update_req.vx_last = vx_last;
+        sd_update_req.vy_last = vy_last;
+        sd_update_req.has_vel = has_vel;
+
+        SDMMResult sd_update_out;
+        SD_MMEvaluate(nullptr, sd_update_req, sd_update_out);
+
+        vx_last = sd_update_out.vx_last;
+        vy_last = sd_update_out.vy_last;
+        has_vel = sd_update_out.has_vel;
+
+        updatePaperProvisionalState(cand, roadHeading, prevState);
+        currentSegId = cand.seg_id;
+        has_prev = true;
+        hasPrevObs = true;
+        prevObsX = x_obs;
+        prevObsY = y_obs;
+    }
+
+    return chosen;
+}
 
 static void writeMatchedTxt(
     const std::string& out_file,
@@ -1405,6 +2465,16 @@ void RunStateMachineMapMatching(
     std::vector<std::pair<double, double> > nodeXY;
 
     buildRoadGraph(segments, segExt, graph, nodeXY);
+
+    std::vector<SeqCandidate> paperChosen =
+        runPaperStateMachineMM(coords, segments, adjacency, ref);
+
+    writeMatchedTxt(out_file, coords, paperChosen, ref);
+    writeMatchedKML(out_file, coords, paperChosen, ref);
+
+    std::cout << "MapMarching paper-style SMP/RMP/IMP/EDP 匹配完成，输出: "
+        << out_file << std::endl;
+    return;
 
     std::vector<std::vector<SeqCandidate> > allCands(coords.size());
     std::vector<EpochMeta> meta(coords.size());

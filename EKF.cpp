@@ -125,6 +125,108 @@ int FindNearestMatchedIndex(
     return best;
 }
 
+struct MatchedObservation
+{
+    const CarPoint* point = nullptr;
+    int index = -1;
+    double x = NaNValue();
+    double y = NaNValue();
+    bool trusted = true;
+    double qualityScore = 1.0;
+};
+
+double SafeQualityScore(double value)
+{
+    return std::isfinite(value) ? ClampDouble(value, 0.0, 1.0) : 1.0;
+}
+
+bool PointToXY(const CarPoint& point, const LocalRef& ref, double& x, double& y)
+{
+    if (!HasValidMatchedPosition(point)) {
+        return false;
+    }
+
+    BlhToXY(point.BLH[0], point.BLH[1], ref, x, y);
+    return std::isfinite(x) && std::isfinite(y);
+}
+
+bool TryInterpolatedMatchedObservation(
+    const std::vector<CarPoint>& matchedPoints,
+    long long timestamp,
+    size_t cursor,
+    const LocalRef& ref,
+    MatchedObservation& observation)
+{
+    if (matchedPoints.empty() || cursor + 1 >= matchedPoints.size()) {
+        return false;
+    }
+
+    const CarPoint& left = matchedPoints[cursor];
+    const CarPoint& right = matchedPoints[cursor + 1];
+    if (timestamp < left.timestamp || timestamp > right.timestamp
+        || right.timestamp <= left.timestamp) {
+        return false;
+    }
+
+    double leftX = 0.0;
+    double leftY = 0.0;
+    double rightX = 0.0;
+    double rightY = 0.0;
+    if (!PointToXY(left, ref, leftX, leftY) || !PointToXY(right, ref, rightX, rightY)) {
+        return false;
+    }
+
+    const double ratio =
+        static_cast<double>(timestamp - left.timestamp)
+        / static_cast<double>(right.timestamp - left.timestamp);
+    if (!std::isfinite(ratio) || ratio < 0.0 || ratio > 1.0) {
+        return false;
+    }
+
+    observation.x = leftX + (rightX - leftX) * ratio;
+    observation.y = leftY + (rightY - leftY) * ratio;
+
+    const double leftQuality = SafeQualityScore(left.quality_score);
+    const double rightQuality = SafeQualityScore(right.quality_score);
+    observation.qualityScore = leftQuality + (rightQuality - leftQuality) * ratio;
+    observation.trusted = left.trusted && right.trusted;
+    return true;
+}
+
+bool FindMatchedObservation(
+    const std::vector<CarPoint>& matchedPoints,
+    long long timestamp,
+    size_t& cursor,
+    long long maxDiffMs,
+    const LocalRef& ref,
+    MatchedObservation& observation)
+{
+    const int nearestIndex = FindNearestMatchedIndex(
+        matchedPoints,
+        timestamp,
+        cursor,
+        maxDiffMs);
+    if (nearestIndex < 0) {
+        return false;
+    }
+
+    observation.index = nearestIndex;
+    observation.point = &matchedPoints[nearestIndex];
+    observation.trusted = observation.point->trusted;
+    observation.qualityScore = SafeQualityScore(observation.point->quality_score);
+
+    if (TryInterpolatedMatchedObservation(
+        matchedPoints,
+        timestamp,
+        cursor,
+        ref,
+        observation)) {
+        return std::isfinite(observation.x) && std::isfinite(observation.y);
+    }
+
+    return PointToXY(*observation.point, ref, observation.x, observation.y);
+}
+
 void Symmetrize(double p[EKF_STATE_SIZE][EKF_STATE_SIZE])
 {
     for (int r = 0; r < EKF_STATE_SIZE; ++r) {
@@ -322,23 +424,21 @@ std::vector<CarPoint> RunEKFFusion(
         double gnssY = 0.0;
         BlhToXY(gnss.BLH[0], gnss.BLH[1], ref, gnssX, gnssY);
 
-        const int matchedIndex = FindNearestMatchedIndex(
+        MatchedObservation matchedObservation;
+        const bool hasMatchedObservation = FindMatchedObservation(
             matchedPoints,
             timestamp,
             matchedCursor,
-            options.maxPseudoTimeDiffMs);
-
+            options.maxPseudoTimeDiffMs,
+            ref,
+            matchedObservation);
         const CarPoint* matched = nullptr;
         double roadX = NaNValue();
         double roadY = NaNValue();
-        if (matchedIndex >= 0) {
-            matched = &matchedPoints[matchedIndex];
-            if (HasValidMatchedPosition(*matched)) {
-                BlhToXY(matched->BLH[0], matched->BLH[1], ref, roadX, roadY);
-            }
-            else {
-                matched = nullptr;
-            }
+        if (hasMatchedObservation) {
+            matched = matchedObservation.point;
+            roadX = matchedObservation.x;
+            roadY = matchedObservation.y;
         }
 
         if (!initialized) {
@@ -384,8 +484,8 @@ std::vector<CarPoint> RunEKFFusion(
         if (options.useRoadPseudo && matched != nullptr
             && std::isfinite(roadX) && std::isfinite(roadY)) {
             const double roadScale = QualityNoiseScale(
-                matched->trusted,
-                matched->quality_score,
+                matchedObservation.trusted,
+                matchedObservation.qualityScore,
                 options);
             const double roadVar =
                 options.roadPositionNoiseM * options.roadPositionNoiseM * roadScale;

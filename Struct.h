@@ -134,10 +134,10 @@ struct EKFOptions
 
     double gnssPositionNoiseM = 6.0;         // GNSS 位置观测标准差，单位 m。
     double gnssVelocityNoiseMps = 1.5;       // GNSS 速度观测标准差，单位 m/s。
-    double roadPositionNoiseM = 2.0;         // MM/HMM 道路伪观测标准差，单位 m。
+    double roadPositionNoiseM = 0.5;         // MM/HMM 道路伪观测标准差，单位 m。
 
-    double minQuality = 0.05;                // 质量评分下限，避免噪声无限放大。
-    double untrustedNoiseScale = 25.0;       // SD 标记不可信时的噪声放大倍数。
+    double minQuality = 0.20;                // 质量评分下限，避免噪声无限放大。
+    double untrustedNoiseScale = 4.0;        // SD 标记不可信时的噪声放大倍数。
     long long maxPseudoTimeDiffMs = 1000;    // 伪观测和 GNSS 的最大时间差，单位 ms。
 
     bool useGnssVelocity = true;             // 是否使用 GNSS 速度作为速度观测。
